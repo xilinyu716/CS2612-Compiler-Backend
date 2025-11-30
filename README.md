@@ -59,19 +59,6 @@
 
 ## 构建与测试
 
-### 本地构建（Windows/任意平台）
-
-- 依赖：`g++ (C++17)` 或兼容编译器
-- 运行测试：
-  - 推荐使用脚本：`powershell -ExecutionPolicy Bypass -File scripts\build.ps1`
-  - 或使用 CMake：
-    - `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release`
-    - `cmake --build build --config Release`
-    - 运行：`build\run_tests.exe` 与 `build\demo.exe`
-  - 无CMake时可直接编译：
-    - `g++ -std=c++17 -O2 tests/test_all.cpp -o run_tests`
-    - `g++ -std=c++17 -O2 -DBACKEND_MAIN project1.cpp -o demo`
-    - `./run_tests`（Windows为 `run_tests.exe`），随后运行 `./demo`
 
 ### 运行示例
 
@@ -79,13 +66,5 @@
   - `cmake --build build --target demo --config Release` 或脚本自动构建
   - 运行 `demo` 输出 TinyRISC 汇编
 
-## GitHub Actions CI
 
-- 工作流位于 `.github/workflows/ci.yml`，在 `ubuntu-latest` 上使用 `cmake + g++` 构建并运行测试
-
-## 扩展建议
-
-- 增加寄存器分配启发式（权重：使用频次、在循环内使用、指令成本）
-- 更丰富的内存地址表达（基址+偏移、全局内存标签）
-- 更严谨的控制流（真实分支与合并，块级 `phi` 支持）
 
