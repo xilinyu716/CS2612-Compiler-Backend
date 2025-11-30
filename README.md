@@ -1,0 +1,91 @@
+# 编译器后端：寄存器分配与汇编生成
+
+本项目实现了一个工业化可扩展的后端原型，包含：
+
+- 在控制流图（CFG）上按指令计算 `use/def`
+- 基于 `use/def` 的指令级活性分析，计算 `in/out`
+- 生成干扰图（Interference Graph）
+- 基于干扰图的寄存器分配（simplify/spill）并支持溢出后重写CFG
+- 支持 start-over 的迭代寄存器分配，直到无溢出或达到保护上限
+- 生成 TinyRISC 风格的汇编代码
+- 测试框架与CI工作流
+
+## 数据结构与输入格式
+
+- `Operand`：操作数，类型包括 `VirtReg`（虚拟寄存器，整数ID）、`Imm`（立即数）、`MemSlot`（栈槽ID，用于溢出装载/存储）、`Label`
+- `Instr`：指令，`OpKind` 包含 `Add/Sub/Mul/CmpLT/Load/Store/Move/Jump/CJump/Label`
+  - `Add/Sub/Mul/CmpLT/Move`：三地址形式，`dst = op(src1, src2)` 或 `dst = src1`
+  - `Load`：`dst = [fp - slot*4]`
+  - `Store`：`[fp - slot*4] = src1`
+  - `Jump/CJump`：跳转与条件跳转（条件非零）
+- `BasicBlock`：基本块，包含 `instrs/succ/pred/label`
+- `CFG`：控制流图，`blocks` 与 `entry`
+
+你可以自由构造 `CFG`，示例见 `tests/test_all.cpp` 中 `makeSampleCFG()`。
+
+## use/def 与活性分析
+
+- `use/def`：对每条指令计算使用与定义的虚拟寄存器集合
+- 活性分析：对每条指令计算 `in/out`，采用自底向上的迭代数据流：
+  - `out[i] = \bigcup in[s]`（后继）或 `in[next]`（块内顺序）
+  - `in[i] = use[i] ∪ (out[i] − def[i])`
+
+## 干扰图与寄存器分配
+
+- 干扰图边规则：若指令在位置 `i` 定义 `d`，则对 `out[i]` 中所有活跃寄存器 `v` 加边 `(d, v)`
+- 分配算法：
+  - `simplify`：度 `< K` 的节点入栈并从图中移除
+  - 若无法简化，选择最大度节点作为 `spill` 候选，入栈并移除
+  - `select`：出栈着色，若无可用颜色则标记为 `spilled`
+
+## 溢出重写与 start-over
+
+- 对被标记为溢出的虚拟寄存器 `v`：
+  - 每次使用前插入 `LOAD t, [slot_v]`，将该使用替换为临时 `t`
+  - 每次定义后插入 `STORE [slot_v], t`，将定义替换为临时 `t`
+- 重写产生新的临时与栈槽，随后重新计算 `use/def`、活性、干扰图并再次分配，直到无溢出或达到迭代上限。
+
+## 汇编代码风格（TinyRISC）
+
+- 物理寄存器：`R0..R(K-1)`，`K` 可配置（默认 `6`）
+- 栈框架：使用 `fp` 与 `sp`，函数序言/结尾：
+  - `PUSH fp` / `MOV fp, sp` / `SUB sp, sp, #stack_bytes`
+  - 结束：`ADD sp, sp, #stack_bytes` / `POP fp` / `RET`
+- 指令模板：
+  - `ADD dst, src1, src2` / `SUB` / `MUL` / `CMPLT`
+  - `MOV dst, src1`
+  - `LOAD dst, [fp-offset]` / `STORE [fp-offset], src`
+  - `BR label` / `BNEZ r, label`
+
+## 构建与测试
+
+### 本地构建（Windows/任意平台）
+
+- 依赖：`g++ (C++17)` 或兼容编译器
+- 运行测试：
+  - 推荐使用脚本：`powershell -ExecutionPolicy Bypass -File scripts\build.ps1`
+  - 或使用 CMake：
+    - `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release`
+    - `cmake --build build --config Release`
+    - 运行：`build\run_tests.exe` 与 `build\demo.exe`
+  - 无CMake时可直接编译：
+    - `g++ -std=c++17 -O2 tests/test_all.cpp -o run_tests`
+    - `g++ -std=c++17 -O2 -DBACKEND_MAIN project1.cpp -o demo`
+    - `./run_tests`（Windows为 `run_tests.exe`），随后运行 `./demo`
+
+### 运行示例
+
+- 构建带演示 `main`：
+  - `cmake --build build --target demo --config Release` 或脚本自动构建
+  - 运行 `demo` 输出 TinyRISC 汇编
+
+## GitHub Actions CI
+
+- 工作流位于 `.github/workflows/ci.yml`，在 `ubuntu-latest` 上使用 `cmake + g++` 构建并运行测试
+
+## 扩展建议
+
+- 增加寄存器分配启发式（权重：使用频次、在循环内使用、指令成本）
+- 更丰富的内存地址表达（基址+偏移、全局内存标签）
+- 更严谨的控制流（真实分支与合并，块级 `phi` 支持）
+
