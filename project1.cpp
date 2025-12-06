@@ -81,11 +81,14 @@ struct UseDef {
 static UseDef computeUseDef(const Instr &ins) {
     UseDef ud;
     auto addUse = [&](const std::optional<Operand> &o){ if (o && o->isVirt()) ud.use.insert(o->value); };
-    auto addDef = [&](const std::optional<Operand> &o){ if (o && o->isVirt()) ud.def.insert(o->value); };
+    auto addDef = [&](const std::optional<Operand> &o) {if (o && o->isVirt()) ud.use.insert(o->value); };
     switch (ins.op) {
         case OpKind::Add:
+            addUse(ins.src1); addUse(ins.src2); addDef(ins.dst); break;
         case OpKind::Sub:
+            addUse(ins.src1); addUse(ins.src2); addDef(ins.dst); break;
         case OpKind::Mul:
+            addUse(ins.src1); addUse(ins.src2); addDef(ins.dst); break;
         case OpKind::CmpLT:
             addUse(ins.src1); addUse(ins.src2); addDef(ins.dst); break;
         case OpKind::Move:
@@ -97,6 +100,7 @@ static UseDef computeUseDef(const Instr &ins) {
         case OpKind::CJump:
             addUse(ins.src1); break;
         case OpKind::Jump:
+            break;
         case OpKind::Label:
             break;
     }
@@ -110,11 +114,15 @@ struct LivenessInfo {
 };
 
 static LivenessInfo liveness(const CFG &cfg) {
-    LivenessInfo lv; lv.in.resize(cfg.blocks.size()); lv.out.resize(cfg.blocks.size());
+    LivenessInfo lv; 
+
+    lv.in.resize(cfg.blocks.size()); 
+    lv.out.resize(cfg.blocks.size());
     for (size_t b = 0; b < cfg.blocks.size(); ++b) {
         lv.in[b].resize(cfg.blocks[b].instrs.size());
         lv.out[b].resize(cfg.blocks[b].instrs.size());
     }
+
     bool changed = true;
     while (changed) {
         changed = false;
@@ -124,9 +132,13 @@ static LivenessInfo liveness(const CFG &cfg) {
                 const auto &ins = blk.instrs[i];
                 UseDef ud = computeUseDef(ins);
                 RegSet outSet;
+
+                // case 1: only 1 success (iff the instruction is not the end of basic block)
                 if (i + 1 < (int)blk.instrs.size()) {
                     outSet = lv.in[b][i + 1];
-                } else {
+                } 
+                // case 2: could have >= 1 success (iff is the end of block)
+                else {
                     for (int s : blk.succ) {
                         if (!cfg.blocks[s].instrs.empty()) {
                             for (int v : lv.in[s][0]) outSet.insert(v);
@@ -134,7 +146,12 @@ static LivenessInfo liveness(const CFG &cfg) {
                     }
                 }
                 RegSet inSet = ud.use;
-                for (int v : outSet) if (!ud.def.count(v)) inSet.insert(v);
+
+                for (int v : outSet)
+                {
+                    if (!ud.def.count(v)) {inSet.insert(v);}
+                }
+
                 if (lv.in[b][i] != inSet || lv.out[b][i] != outSet) {
                     lv.in[b][i] = std::move(inSet);
                     lv.out[b][i] = std::move(outSet);
@@ -154,6 +171,10 @@ static InterferenceGraph buildInterference(const CFG &cfg, const LivenessInfo &l
     InterferenceGraph g;
     for (size_t b = 0; b < cfg.blocks.size(); ++b) {
         const auto &blk = cfg.blocks[b];
+
+        // optimization
+        // We only need to allocate register for a variable when it's defined
+        // Then we check the out set of the instruction
         for (size_t i = 0; i < blk.instrs.size(); ++i) {
             UseDef ud = computeUseDef(blk.instrs[i]);
             for (int d : ud.def) {
@@ -196,9 +217,12 @@ static AllocationResult allocateRegisters(const InterferenceGraph &g, int K) {
                 ++it;
             }
         }
+
+        // cannot simplify any more, spill
         if (!simplified) {
             // spill: pick max degree
-            int pick = -1; size_t best = 0;
+            int pick = -1; 
+            size_t best = 0;
             for (int n : nodes) {
                 size_t deg = adj[n].size();
                 if (deg >= best) { best = deg; pick = n; }
@@ -210,6 +234,7 @@ static AllocationResult allocateRegisters(const InterferenceGraph &g, int K) {
             nodes.erase(pick);
         }
     }
+
     // select
     std::unordered_map<int, RegSet> orig = g.adj;
     while (!stack.empty()) {
@@ -221,6 +246,7 @@ static AllocationResult allocateRegisters(const InterferenceGraph &g, int K) {
         }
         int color = -1;
         for (int c = 0; c < K; ++c) if (!usedColors.count(c)) { color = c; break; }
+        
         if (color == -1) res.spilled.insert(n);
         else res.assign[n] = color;
     }
@@ -239,24 +265,57 @@ struct RewriteResult {
 static RewriteResult rewriteForSpills(const CFG &orig, const std::unordered_set<int> &spilled, int startVirt = 1000, int startSlot = 0) {
     RewriteResult rr{orig, {}, startVirt, startSlot};
     auto isSpilled = [&](const std::optional<Operand> &o){ return o && o->isVirt() && spilled.count(o->value); };
-    auto getSlot = [&](int v){ auto it = rr.spillSlot.find(v); if (it!=rr.spillSlot.end()) return it->second; int s = rr.nextSlot++; rr.spillSlot[v]=s; return s; };
+    
+    auto getSlot = [&](int v){ 
+        auto it = rr.spillSlot.find(v); 
+        if (it!=rr.spillSlot.end()) return it->second; 
+        int s = rr.nextSlot++; 
+        rr.spillSlot[v]=s; 
+        return s; };
+
     for (auto &blk : rr.cfg.blocks) {
         std::vector<Instr> newIns;
+
         for (auto &ins : blk.instrs) {
-            auto emitLoad = [&](int v){ int t = rr.nextVirt++; int slot = getSlot(v); newIns.push_back(Instr{OpKind::Load, Operand::virt(t), {}, {}, Operand::mem(slot)}); return t; };
-            auto emitStore = [&](int v, int from){ int slot = getSlot(v); newIns.push_back(Instr{OpKind::Store, {}, Operand::virt(from), {}, Operand::mem(slot)}); };
+
+            auto emitLoad = [&](int v){ 
+                int t = rr.nextVirt++; 
+                int slot = getSlot(v); 
+                newIns.push_back(Instr{OpKind::Load, Operand::virt(t), {}, {}, Operand::mem(slot)}); 
+                return t; 
+            };
+
+            auto emitStore = [&](int v, int from){ 
+                int slot = getSlot(v); newIns.push_back(Instr{OpKind::Store, {}, Operand::virt(from), {}, Operand::mem(slot)}); };
+                
+                
             if (ins.op == OpKind::Label || ins.op == OpKind::Jump || ins.op == OpKind::CJump) {
                 newIns.push_back(ins);
                 continue;
             }
+
             bool use1Sp = isSpilled(ins.src1);
             bool use2Sp = isSpilled(ins.src2);
             bool defSp = isSpilled(ins.dst);
+
             int t1 = -1, t2 = -1, td = -1;
+
             Instr mod = ins;
-            if (use1Sp) { t1 = emitLoad(ins.src1->value); mod.src1 = Operand::virt(t1); }
-            if (use2Sp) { t2 = emitLoad(ins.src2->value); mod.src2 = Operand::virt(t2); }
-            if (defSp && mod.dst) { td = rr.nextVirt++; mod.dst = Operand::virt(td); }
+            if (use1Sp) 
+            { 
+                t1 = emitLoad(ins.src1->value); 
+                mod.src1 = Operand::virt(t1); 
+            }
+            if (use2Sp) 
+            { 
+                t2 = emitLoad(ins.src2->value);
+                mod.src2 = Operand::virt(t2); 
+            }
+            if (defSp && mod.dst) 
+            { 
+                td = rr.nextVirt++; 
+                mod.dst = Operand::virt(td); 
+            }
             newIns.push_back(mod);
             if (defSp && td != -1) emitStore(ins.dst->value, td);
         }
@@ -359,270 +418,6 @@ int main() {
     Backend be; be.cfg.K = 3;
     auto out = be.compile(g);
     std::cout << out.asmText << std::endl;
-    return 0;
-}
-#endif
-#ifdef LIVENESS_MAIN
-#include <vector>
-#include <string>
-#include <set>
-#include <algorithm>
-#include <iterator>
-using namespace std;
-using Variable = string;
-using VariableSet = set<Variable>;
-
-enum class InstructionType {
-    ASSIGN_ARITHMETIC,
-    ASSIGN_CONSTANT,
-    COMPARE,
-    MEMORY_STORE,
-    MEMORY_LOAD,
-    JUMP,
-    CONDITIONAL_JUMP,
-};
-
-struct Instruction {
-    InstructionType type;
-    string id;
-    VariableSet use;
-    VariableSet def;
-    VariableSet in;
-    VariableSet out;
-    Variable result_var;
-    Variable operand1;
-    Variable operand2;
-    Variable address_var;
-    Instruction(InstructionType t, const string& i) : type(t), id(i) {}
-};
-
-struct BasicBlock {
-    string label;
-    vector<Instruction> instructions;
-    vector<BasicBlock*> successors;
-    VariableSet in;
-    VariableSet out;
-};
-
-VariableSet set_difference(const VariableSet& a, const VariableSet& b) {
-    VariableSet result;
-    set_difference(a.begin(), a.end(), b.begin(), b.end(),
-                   inserter(result, result.begin()));
-    return result;
-}
-
-VariableSet set_union(const VariableSet& a, const VariableSet& b) {
-    VariableSet result = a;
-    result.insert(b.begin(), b.end());
-    return result;
-}
-
-void compute_instruction_use_def(Instruction& instr) {
-    instr.use.clear();
-    instr.def.clear();
-    auto safe_insert = [](VariableSet& set, const Variable& var) {
-        if (!var.empty()) {
-            set.insert(var);
-        }
-    };
-    switch (instr.type) {
-        case InstructionType::ASSIGN_ARITHMETIC:
-        case InstructionType::COMPARE:
-            safe_insert(instr.def, instr.result_var);
-            safe_insert(instr.use, instr.operand1);
-            safe_insert(instr.use, instr.operand2);
-            break;
-        case InstructionType::ASSIGN_CONSTANT:
-            safe_insert(instr.def, instr.result_var);
-            break;
-        case InstructionType::MEMORY_STORE:
-            safe_insert(instr.use, instr.operand1);
-            safe_insert(instr.use, instr.address_var);
-            break;
-        case InstructionType::MEMORY_LOAD:
-            safe_insert(instr.def, instr.result_var);
-            safe_insert(instr.use, instr.address_var);
-            break;
-        case InstructionType::CONDITIONAL_JUMP:
-            safe_insert(instr.use, instr.operand1);
-            break;
-        case InstructionType::JUMP:
-            break;
-    }
-}
-
-void compute_cfg_use_def(vector<BasicBlock>& cfg_blocks) {
-    for (auto& block : cfg_blocks) {
-        for (auto& instruction : block.instructions) {
-            compute_instruction_use_def(instruction);
-        }
-    }
-}
-
-// ------------------------------------
-// ���Է���ʵ��
-// ------------------------------------
-
-void liveness_analysis(vector<BasicBlock>& cfg_blocks) {
-    bool changed;
-    do {
-        changed = false;
-        // �������������
-        for (auto it = cfg_blocks.rbegin(); it != cfg_blocks.rend(); ++it) {
-            BasicBlock& block = *it;
-
-            // 1. ���� Basic Block �� OUT ����
-            // out(B) = Union of in(S) for all successors S of B
-            VariableSet new_block_out;
-            for (BasicBlock* succ : block.successors) {
-                new_block_out = set_union(new_block_out, succ->in);
-            }
-            if (new_block_out != block.out) {
-                block.out = new_block_out;
-                changed = true;
-            }
-
-            // 2. ����ָ��Ļ��Դ��� (����)
-            VariableSet current_in = block.out;
-
-            // �����������ָ��
-            for (auto instr_it = block.instructions.rbegin(); instr_it != block.instructions.rend(); ++instr_it) {
-                Instruction& instr = *instr_it;
-
-                // out(u) = in(u+1)
-                instr.out = current_in;
-
-                // in(u) = (out(u) - def(u)) U use(u)
-                VariableSet new_in = set_union(set_difference(instr.out, instr.def), instr.use);
-
-                if (new_in != instr.in) {
-                    instr.in = new_in;
-                    changed = true;
-                }
-
-                // Ϊǰһ��ָ������ out
-                current_in = instr.in;
-            }
-
-            // 3. ���� Basic Block �� IN ����
-            // in(B) �ǿ��ڵ�һ��ָ��� in ����
-            if (!block.instructions.empty()) {
-                VariableSet new_block_in = block.instructions.front().in;
-                if (new_block_in != block.in) {
-                    block.in = new_block_in;
-                }
-            }
-        }
-    } while (changed);
-}
-
-void print_instruction_liveness(const Instruction& instr) {
-    auto print_set = [](const VariableSet& s) {
-        cout << "{";
-        bool first = true;
-        for (const auto& var : s) {
-            if (!first) cout << ", ";
-            cout << var;
-            first = false;
-        }
-        cout << "}";
-    };
-
-    cout << "  Instruction " << instr.id << ":\n";
-    cout << "    DEF: ";  print_set(instr.def);
-    cout << " | USE: ";  print_set(instr.use);
-    cout << " | IN: ";   print_set(instr.in);
-    cout << " | OUT: ";  print_set(instr.out);
-    cout << "\n";
-}
-
-void print_block_liveness(const BasicBlock& block) {
-    auto print_set = [](const VariableSet& s) {
-        cout << "{";
-        bool first = true;
-        for (const auto& var : s) {
-            if (!first) cout << ", ";
-            cout << var;
-            first = false;
-        }
-        cout << "}";
-    };
-    cout << "Basic Block " << block.label << " Summary:\n";
-    cout << "  IN: "; print_set(block.in);
-    cout << " | OUT: "; print_set(block.out);
-    cout << "\n";
-}
-
-int main() {
-    // 1. ���� CFG �ṹ
-    vector<BasicBlock> cfg;
-    BasicBlock bb1;
-    bb1.label = "L1";
-    BasicBlock bb2;
-    bb2.label = "L2";
-
-    // 2. L1 ָ��
-    bb1.instructions.emplace_back(InstructionType::ASSIGN_ARITHMETIC, "i1");
-    bb1.instructions.back().result_var = "v1";
-    bb1.instructions.back().operand1 = "v2";
-    bb1.instructions.back().operand2 = "v3";
-
-    bb1.instructions.emplace_back(InstructionType::COMPARE, "i2");
-    bb1.instructions.back().result_var = "v4";
-    bb1.instructions.back().operand1 = "v1";
-    bb1.instructions.back().operand2 = "v5";
-
-    bb1.instructions.emplace_back(InstructionType::MEMORY_STORE, "i3");
-    bb1.instructions.back().address_var = "p";
-    bb1.instructions.back().operand1 = "v4";
-
-    bb1.instructions.emplace_back(InstructionType::MEMORY_LOAD, "i4");
-    bb1.instructions.back().result_var = "v6";
-    bb1.instructions.back().address_var = "p";
-
-    bb1.instructions.emplace_back(InstructionType::CONDITIONAL_JUMP, "i5");
-    bb1.instructions.back().operand1 = "v6";
-
-    // 3. L2 ָ��
-    bb2.instructions.emplace_back(InstructionType::ASSIGN_ARITHMETIC, "i6");
-    bb2.instructions.back().result_var = "v7";
-    bb2.instructions.back().operand1 = "v1";
-    bb2.instructions.back().operand2 = "v5";
-
-    bb2.instructions.emplace_back(InstructionType::ASSIGN_CONSTANT, "i7");
-    bb2.instructions.back().result_var = "v8";
-
-    cfg.push_back(bb1);
-    cfg.push_back(bb2);
-
-    // 4. ���� CFG �ߣ�L1 -> L2
-    cfg[0].successors.push_back(&cfg[1]);
-
-    // 5. ���� Use �� Def
-    compute_cfg_use_def(cfg);
-
-    // 6. ִ�л��Է���
-    liveness_analysis(cfg);
-
-    // 7. ��ӡ���Է������
-    cout << "\n--- ���Է��� (Liveness Analysis) ���ս�� ---\n";
-
-    // ��ӡ����ܽ�
-    print_block_liveness(cfg[1]);
-    print_block_liveness(cfg[0]);
-
-    cout << "\n--- ����ָ������ ---\n";
-
-    cout << "Basic Block L2:\n";
-    for (const auto& instruction : cfg[1].instructions) {
-        print_instruction_liveness(instruction);
-    }
-
-    cout << "\nBasic Block L1:\n";
-    for (const auto& instruction : cfg[0].instructions) {
-        print_instruction_liveness(instruction);
-    }
-
     return 0;
 }
 #endif
