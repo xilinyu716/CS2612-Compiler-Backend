@@ -81,7 +81,7 @@ struct UseDef {
 static UseDef computeUseDef(const Instr &ins) {
     UseDef ud;
     auto addUse = [&](const std::optional<Operand> &o){ if (o && o->isVirt()) ud.use.insert(o->value); };
-    auto addDef = [&](const std::optional<Operand> &o) {if (o && o->isVirt()) ud.use.insert(o->value); };
+    auto addDef = [&](const std::optional<Operand> &o) {if (o && o->isVirt()) ud.def.insert(o->value); };
     switch (ins.op) {
         case OpKind::Add:
             addUse(ins.src1); addUse(ins.src2); addDef(ins.dst); break;
@@ -332,7 +332,13 @@ static CodeGenResult generateAsm(const CFG &cfg, const std::unordered_map<int,in
     std::ostringstream os;
     os << "; TinyRISC assembly (R0..R" << (K-1) << ")\n";
     os << "PUSH fp\nMOV fp, sp\nSUB sp, sp, #" << (stackSlots*4) << "\n";
-    auto phys = [&](int virt){ auto it = assign.find(virt); int p = (it==assign.end()?0:it->second); return std::string("R") + std::to_string(p); };
+
+    // mapping to physical registers
+    auto phys = [&](int virt){ 
+        auto it = assign.find(virt); 
+        int p = (it==assign.end()?0:it->second); 
+        return std::string("R") + std::to_string(p); };
+
     for (const auto &blk : cfg.blocks) {
         os << blk.label << ":\n";
         for (const auto &ins : blk.instrs) {
@@ -361,7 +367,11 @@ static CodeGenResult generateAsm(const CFG &cfg, const std::unordered_map<int,in
         }
     }
     os << "ADD sp, sp, #" << (stackSlots*4) << "\nPOP fp\nRET\n";
-    CodeGenResult r; r.asmText = os.str(); r.usedRegs = K; r.stackSlots = stackSlots; return r;
+    CodeGenResult r; 
+    r.asmText = os.str(); 
+    r.usedRegs = K; 
+    r.stackSlots = stackSlots; 
+    return r;
 }
 
 struct Backend {
@@ -370,10 +380,15 @@ struct Backend {
         int K = cfg.K;
         int stackSlots = 0;
         int guard = 20;
+
+        // At most rewrite guard rounds
         while (guard--) {
             auto lv = liveness(ir);
             auto ig = buildInterference(ir, lv);
             auto alloc = allocateRegisters(ig, K);
+
+
+            // If K is too small, force rewriting even if spilled.empty()
             if (alloc.spilled.empty()) {
                 if (K <= 2 && !ig.adj.empty()) {
                     int pick = -1; size_t best = 0;
@@ -408,12 +423,35 @@ struct Backend {
 int main() {
     using namespace backend;
     CFG g;
+    // Construct a loop: L0 -> L1 -> L2 -> (cond) -> L1 or exit L3
+    // L0: initialize v0, v1
     BasicBlock b0{0, "L0", {}, {1}, {}};
-    b0.instrs.push_back(Instr{OpKind::Add, Operand::virt(0), Operand::virt(1), Operand::virt(2), {}});
-    b0.instrs.push_back(Instr{OpKind::Mul, Operand::virt(3), Operand::virt(0), Operand::virt(4), {}});
-    BasicBlock b1{1, "L1", {}, {}, {0}};
-    b1.instrs.push_back(Instr{OpKind::CmpLT, Operand::virt(5), Operand::virt(3), Operand::virt(6), {}});
-    g.blocks.push_back(b0); g.blocks.push_back(b1);
+    b0.instrs.push_back(Instr{OpKind::Add, Operand::virt(0), Operand::virt(1), Operand::virt(2), {}}); // v0 = v1 + v2
+    b0.instrs.push_back(Instr{OpKind::Move, Operand::virt(7), Operand::virt(0), {}, {}});              // i = v0
+
+    // L1: loop body i = i + v3; t = i * v4
+    BasicBlock b1{1, "L1", {}, {2}, {0,2}};
+    b1.instrs.push_back(Instr{OpKind::Add, Operand::virt(7), Operand::virt(7), Operand::virt(3), {}});
+    b1.instrs.push_back(Instr{OpKind::Mul, Operand::virt(8), Operand::virt(7), Operand::virt(4), {}});
+
+    // L2: compare t < v5, branch to L1 if true else L3
+    BasicBlock b2{2, "L2", {}, {1,3}, {1}};
+    b2.instrs.push_back(Instr{OpKind::CmpLT, Operand::virt(9), Operand::virt(8), Operand::virt(5), {}});
+    b2.instrs.push_back(Instr{OpKind::CJump, {}, Operand::virt(9), {}, Operand::lab("L1")});
+    b2.instrs.push_back(Instr{OpKind::Jump, {}, {}, {}, Operand::lab("L3")});
+
+    // L3: exit, compute final result r = i + t
+    BasicBlock b3{3, "L3", {}, {}, {2}};
+    b3.instrs.push_back(Instr{OpKind::Add, Operand::virt(10), Operand::virt(7), Operand::virt(8), {}});
+
+    g.blocks.push_back(b0); g.blocks.push_back(b1); g.blocks.push_back(b2); g.blocks.push_back(b3);
+    g.blocks[0].succ = {1};
+    g.blocks[1].succ = {2};
+    g.blocks[2].succ = {1,3};
+    g.blocks[3].succ = {};
+    g.blocks[1].pred = {0,2};
+    g.blocks[2].pred = {1};
+    g.blocks[3].pred = {2};
 
     Backend be; be.cfg.K = 3;
     auto out = be.compile(g);
