@@ -9,3 +9,6 @@ add_executable(run_tests tests/test_all.cpp)
 add_executable(demo project1.cpp)
 target_compile_definitions(demo PRIVATE BACKEND_MAIN)
 
+enable_testing()
+add_test(NAME backend_tests COMMAND run_tests)
+

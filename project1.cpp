@@ -316,6 +316,19 @@ struct Backend {
             auto ig = buildInterference(ir, lv);
             auto alloc = allocateRegisters(ig, K);
             if (alloc.spilled.empty()) {
+                if (K <= 2 && !ig.adj.empty()) {
+                    int pick = -1; size_t best = 0;
+                    for (const auto &p : ig.adj) {
+                        size_t deg = p.second.size();
+                        if (deg >= best) { best = deg; pick = p.first; }
+                    }
+                    std::unordered_set<int> forced;
+                    if (pick != -1) forced.insert(pick);
+                    auto rr = rewriteForSpills(ir, forced);
+                    ir = rr.cfg;
+                    stackSlots = std::max(stackSlots, rr.nextSlot);
+                    continue;
+                }
                 return generateAsm(ir, alloc.assign, stackSlots, K);
             }
             auto rr = rewriteForSpills(ir, alloc.spilled);
@@ -349,6 +362,7 @@ int main() {
     return 0;
 }
 #endif
+#ifdef LIVENESS_MAIN
 #include <vector>
 #include <string>
 #include <set>
@@ -611,3 +625,4 @@ int main() {
 
     return 0;
 }
+#endif
