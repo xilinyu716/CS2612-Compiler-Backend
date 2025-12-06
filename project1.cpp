@@ -369,7 +369,74 @@ static CodeGenResult generateAsm(const CFG &cfg, const std::unordered_map<int,in
     r.stackSlots = stackSlots; 
     return r;
 }
+/*
+static CodeGenResult generateAsm(const CFG &cfg, const std::unordered_map<int,int> &assign, int stackSlots, int K) {
+    std::ostringstream os;
+    os << "; TinyRISC assembly (R0..R" << (K-1) << ")\n";
+    os << "PUSH fp\nMOV fp, sp\nSUB sp, sp, #" << (stackSlots*4) << "\n";
 
+    // 辅助函数：根据 Operand 类型打印（是寄存器就查表，是立即数就打 #Val）
+    auto formatOp = [&](const Operand &op) -> std::string {
+        if (op.isImm()) {
+            return "#" + std::to_string(op.value);
+        } else if (op.isVirt()) {
+            auto it = assign.find(op.value);
+            int p = (it == assign.end() ? 0 : it->second);
+            return "R" + std::to_string(p);
+        }
+        return "?";
+    };
+
+    // 辅助函数：专门用于只接受寄存器的场合（如 LOAD/STORE 的目标/源）
+    // 虽然在这个简单的后端里所有虚拟寄存器最终都会分配物理寄存器，
+    // 但为了代码清晰，保留这个逻辑，默认如果不是寄存器就回退到 formatOp
+    auto physReg = [&](const Operand &op) -> std::string {
+        return formatOp(op);
+    };
+
+    for (const auto &blk : cfg.blocks) {
+        os << blk.label << ":\n";
+        for (const auto &ins : blk.instrs) {
+            switch (ins.op) {
+                case OpKind::Add:
+                    // dst 是寄存器，src1/src2 可能是立即数
+                    os << "ADD " << physReg(*ins.dst) << ", " << formatOp(*ins.src1) << ", " << formatOp(*ins.src2) << "\n";
+                    break;
+                case OpKind::Sub:
+                    os << "SUB " << physReg(*ins.dst) << ", " << formatOp(*ins.src1) << ", " << formatOp(*ins.src2) << "\n";
+                    break;
+                case OpKind::Mul:
+                    os << "MUL " << physReg(*ins.dst) << ", " << formatOp(*ins.src1) << ", " << formatOp(*ins.src2) << "\n";
+                    break;
+                case OpKind::CmpLT:
+                    os << "CMPLT " << physReg(*ins.dst) << ", " << formatOp(*ins.src1) << ", " << formatOp(*ins.src2) << "\n";
+                    break;
+                case OpKind::Move:
+                    os << "MOV " << physReg(*ins.dst) << ", " << formatOp(*ins.src1) << "\n";
+                    break;
+                case OpKind::Load:
+                    // Load 的目标必须是寄存器
+                    os << "LOAD " << physReg(*ins.dst) << ", [fp-" << (ins.extra->value*4) << "]\n";
+                    break;
+                case OpKind::Store:
+                    // Store 的源通常是寄存器，但在某些架构允许立即数存入内存，这里通用处理
+                    os << "STORE [fp-" << (ins.extra->value*4) << "], " << formatOp(*ins.src1) << "\n";
+                    break;
+                case OpKind::Jump:
+                    os << "BR " << ins.extra->label << "\n";
+                    break;
+                case OpKind::CJump:
+                    // 条件跳转判断的值通常在寄存器中
+                    os << "BNEZ " << formatOp(*ins.src1) << ", " << ins.extra->label << "\n";
+                    break;
+                case OpKind::Label:
+                    break;
+            }
+        }
+    }
+    os << "ADD sp, sp, #" << (stackSlots*4) << "\nPOP fp\nRET\n";
+    CodeGenResult r; r.asmText = os.str(); r.usedRegs = K; r.stackSlots = stackSlots; return r;
+}*/
 struct Backend {
     CodeGenConfig cfg;
     CodeGenResult compile(CFG ir) {
@@ -455,3 +522,4 @@ int main() {
     return 0;
 }
 #endif
+
