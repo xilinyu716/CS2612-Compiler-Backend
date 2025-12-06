@@ -172,16 +172,12 @@ static InterferenceGraph buildInterference(const CFG &cfg, const LivenessInfo &l
     for (size_t b = 0; b < cfg.blocks.size(); ++b) {
         const auto &blk = cfg.blocks[b];
 
-        // optimization
-        // We only need to allocate register for a variable when it's defined
-        // Then we check the out set of the instruction
         for (size_t i = 0; i < blk.instrs.size(); ++i) {
-            UseDef ud = computeUseDef(blk.instrs[i]);
-            for (int d : ud.def) {
-                for (int v : lv.out[b][i]) {
-                    if (v == d) continue;
-                    g.adj[d].insert(v);
-                    g.adj[v].insert(d);
+            for (int v : lv.in[b][i]) {
+                for (int u : lv.in[b][i]) {
+                    if (v == u) continue;
+                    g.adj[v].insert(u);
+                    g.adj[u].insert(v);
                 }
             }
         }
