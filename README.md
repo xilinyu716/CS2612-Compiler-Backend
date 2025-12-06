@@ -1,5 +1,5 @@
-# 编译器后端：寄存器分配与汇编生成
-
+# CS2612-Project-1
+## 寄存器分配与CodeGen
 本项目实现了一个工业化可扩展的后端原型，包含：
 
 - 在控制流图（CFG）上按指令计算 `use/def`
@@ -8,7 +8,7 @@
 - 基于干扰图的寄存器分配（simplify/spill）并支持溢出后重写CFG
 - 支持 start-over 的迭代寄存器分配，直到无溢出或达到保护上限
 - 生成 TinyRISC 风格的汇编代码
-- 测试框架与CI工作流
+- 测试框架
 
 ## 数据结构与输入格式
 
@@ -21,7 +21,7 @@
 - `BasicBlock`：基本块，包含 `instrs/succ/pred/label`
 - `CFG`：控制流图，`blocks` 与 `entry`
 
-你可以自由构造 `CFG`，示例见 `tests/test_all.cpp` 中 `makeSampleCFG()`。
+示例见 `tests/test_all.cpp` 中 `makeSampleCFG()`。
 
 ## use/def 与活性分析
 
@@ -58,13 +58,13 @@
   - `BR label` / `BNEZ r, label`
 
 ## 构建与测试
+```bash
+mkdir -p build && cd build
+cmake ..
+cmake --build .
+./demo
+./run_tests```
 
-
-### 运行示例
-
-- 构建带演示 `main`：
-  - `cmake --build build --target demo --config Release` 或脚本自动构建
-  - 运行 `demo` 输出 TinyRISC 汇编
 
 
 
