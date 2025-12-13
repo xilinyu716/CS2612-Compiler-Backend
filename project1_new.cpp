@@ -108,14 +108,12 @@ static UseDef computeUseDef(const Instr &ins) {
 }
 
 struct LivenessInfo {
-    // per block, per instruction
     std::vector<std::vector<RegSet>> in;
     std::vector<std::vector<RegSet>> out;
 };
 
 static LivenessInfo liveness(const CFG &cfg) {
     LivenessInfo lv;
-
     lv.in.resize(cfg.blocks.size());
     lv.out.resize(cfg.blocks.size());
     for (size_t b = 0; b < cfg.blocks.size(); ++b) {
@@ -133,12 +131,9 @@ static LivenessInfo liveness(const CFG &cfg) {
                 UseDef ud = computeUseDef(ins);
                 RegSet outSet;
 
-                // case 1: only 1 success (iff the instruction is not the end of basic block)
                 if (i + 1 < (int)blk.instrs.size()) {
                     outSet = lv.in[b][i + 1];
-                }
-                // case 2: could have >= 1 success (iff is the end of block)
-                else {
+                } else {
                     for (int s : blk.succ) {
                         if (!cfg.blocks[s].instrs.empty()) {
                             for (int v : lv.in[s][0]) outSet.insert(v);
@@ -146,10 +141,8 @@ static LivenessInfo liveness(const CFG &cfg) {
                     }
                 }
                 RegSet inSet = ud.use;
-
-                for (int v : outSet)
-                {
-                    if (!ud.def.count(v)) {inSet.insert(v);}
+                for (int v : outSet) {
+                    if (!ud.def.count(v)) { inSet.insert(v); }
                 }
 
                 if (lv.in[b][i] != inSet || lv.out[b][i] != outSet) {
@@ -164,20 +157,37 @@ static LivenessInfo liveness(const CFG &cfg) {
 }
 
 struct InterferenceGraph {
-    std::unordered_map<int, RegSet> adj; // virt reg -> neighbors
+    std::unordered_map<int, RegSet> adj;
 };
 
+// 【重要修复 1】: 修复干扰图构建逻辑
 static InterferenceGraph buildInterference(const CFG &cfg, const LivenessInfo &lv) {
     InterferenceGraph g;
     for (size_t b = 0; b < cfg.blocks.size(); ++b) {
         const auto &blk = cfg.blocks[b];
 
         for (size_t i = 0; i < blk.instrs.size(); ++i) {
+            const auto &ins = blk.instrs[i];
+
+            // 1. 输入变量之间的干扰 (LiveIn 中的变量两两互斥)
             for (int v : lv.in[b][i]) {
                 for (int u : lv.in[b][i]) {
                     if (v == u) continue;
                     g.adj[v].insert(u);
                     g.adj[u].insert(v);
+                }
+            }
+
+            // 2. 【新增】定义变量与活跃出口变量的干扰
+            // 如果 v 是这行指令定义的，u 是这行指令之后还要用的(LiveOut)，
+            // 那么 v 和 u 必须占用不同寄存器。
+            if (ins.dst && ins.dst->isVirt()) {
+                int d = ins.dst->value;
+                for (int outVar : lv.out[b][i]) {
+                    if (d != outVar) { // 自己不和自己冲突
+                        g.adj[d].insert(outVar);
+                        g.adj[outVar].insert(d);
+                    }
                 }
             }
         }
@@ -186,8 +196,8 @@ static InterferenceGraph buildInterference(const CFG &cfg, const LivenessInfo &l
 }
 
 struct AllocationResult {
-    std::unordered_map<int, int> assign; // virt -> phys
-    std::unordered_set<int> spilled; // virt regs spilled
+    std::unordered_map<int, int> assign;
+    std::unordered_set<int> spilled;
 };
 
 static AllocationResult allocateRegisters(const InterferenceGraph &g, int K) {
@@ -197,6 +207,7 @@ static AllocationResult allocateRegisters(const InterferenceGraph &g, int K) {
     std::unordered_set<int> spillCandidates;
     std::unordered_set<int> nodes;
     for (auto &p : adj) nodes.insert(p.first);
+
     while (!nodes.empty()) {
         bool simplified = false;
         for (auto it = nodes.begin(); it != nodes.end();) {
@@ -204,7 +215,6 @@ static AllocationResult allocateRegisters(const InterferenceGraph &g, int K) {
             size_t deg = adj[n].size();
             if (deg < (size_t)K) {
                 stack.push_back(n);
-                // remove n
                 for (int m : adj[n]) adj[m].erase(n);
                 adj.erase(n);
                 it = nodes.erase(it);
@@ -214,9 +224,7 @@ static AllocationResult allocateRegisters(const InterferenceGraph &g, int K) {
             }
         }
 
-        // cannot simplify any more, spill
         if (!simplified) {
-            // spill: pick max degree
             int pick = -1;
             size_t best = 0;
             for (int n : nodes) {
@@ -231,7 +239,6 @@ static AllocationResult allocateRegisters(const InterferenceGraph &g, int K) {
         }
     }
 
-    // select
     std::unordered_map<int, RegSet> orig = g.adj;
     while (!stack.empty()) {
         int n = stack.back(); stack.pop_back();
@@ -246,44 +253,45 @@ static AllocationResult allocateRegisters(const InterferenceGraph &g, int K) {
         if (color == -1) res.spilled.insert(n);
         else res.assign[n] = color;
     }
-    // also include pure isolated nodes
     for (auto &p : g.adj) if (!res.assign.count(p.first) && !res.spilled.count(p.first)) res.assign[p.first] = 0;
     return res;
 }
 
 struct RewriteResult {
     CFG cfg;
-    std::unordered_map<int, int> spillSlot; // virt -> slot id
+    std::unordered_map<int, int> spillSlot;
     int nextVirt;
     int nextSlot;
 };
 
-// 重写函数接受 startVirt 和 startSlot，用于在多轮分配中保持状态
-static RewriteResult rewriteForSpills(const CFG &orig, const std::unordered_set<int> &spilled, int startVirt = 1000, int startSlot = 0) {
+static RewriteResult rewriteForSpills(const CFG &orig, const std::unordered_set<int> &spilled, int startVirt, int startSlot) {
     RewriteResult rr{orig, {}, startVirt, startSlot};
     auto isSpilled = [&](const std::optional<Operand> &o){ return o && o->isVirt() && spilled.count(o->value); };
 
     auto getSlot = [&](int v){
         auto it = rr.spillSlot.find(v);
         if (it!=rr.spillSlot.end()) return it->second;
-        int s = rr.nextSlot++; // 这里的 nextSlot 是从 startSlot 开始递增的
+        int s = rr.nextSlot++;
         rr.spillSlot[v]=s;
-        return s; };
+        return s;
+    };
 
     for (auto &blk : rr.cfg.blocks) {
         std::vector<Instr> newIns;
 
         for (auto &ins : blk.instrs) {
-
+            // 【重要修复 2】: 栈偏移 +1，避免覆盖 [fp-0]
             auto emitLoad = [&](int v){
                 int t = rr.nextVirt++;
                 int slot = getSlot(v);
-                newIns.push_back(Instr{OpKind::Load, Operand::virt(t), {}, {}, Operand::mem(slot)});
+                newIns.push_back(Instr{OpKind::Load, Operand::virt(t), {}, {}, Operand::mem(slot + 1)});
                 return t;
             };
 
             auto emitStore = [&](int v, int from){
-                int slot = getSlot(v); newIns.push_back(Instr{OpKind::Store, {}, Operand::virt(from), {}, Operand::mem(slot)}); };
+                int slot = getSlot(v);
+                newIns.push_back(Instr{OpKind::Store, {}, Operand::virt(from), {}, Operand::mem(slot + 1)});
+            };
 
 
             if (ins.op == OpKind::Label || ins.op == OpKind::Jump || ins.op == OpKind::CJump) {
@@ -298,18 +306,15 @@ static RewriteResult rewriteForSpills(const CFG &orig, const std::unordered_set<
             int t1 = -1, t2 = -1, td = -1;
 
             Instr mod = ins;
-            if (use1Sp)
-            {
+            if (use1Sp) {
                 t1 = emitLoad(ins.src1->value);
                 mod.src1 = Operand::virt(t1);
             }
-            if (use2Sp)
-            {
+            if (use2Sp) {
                 t2 = emitLoad(ins.src2->value);
                 mod.src2 = Operand::virt(t2);
             }
-            if (defSp && mod.dst)
-            {
+            if (defSp && mod.dst) {
                 td = rr.nextVirt++;
                 mod.dst = Operand::virt(td);
             }
@@ -322,7 +327,6 @@ static RewriteResult rewriteForSpills(const CFG &orig, const std::unordered_set<
 }
 
 struct CodeGenConfig { int K = 6; };
-
 struct CodeGenResult { std::string asmText; int usedRegs; int stackSlots; };
 
 static CodeGenResult generateAsm(const CFG &cfg, const std::unordered_map<int,int> &assign, int stackSlots, int K) {
@@ -365,10 +369,12 @@ static CodeGenResult generateAsm(const CFG &cfg, const std::unordered_map<int,in
                     os << "MOV " << physReg(*ins.dst) << ", " << formatOp(*ins.src1) << "\n";
                     break;
                 case OpKind::Load:
-                    os << "LOAD " << physReg(*ins.dst) << ", [fp-" << (ins.extra->value*4) << "]\n";
+                    // 【重要修复 3】: 生成汇编时偏移 +1
+                    os << "LOAD " << physReg(*ins.dst) << ", [fp-" << ((ins.extra->value + 1) * 4) << "]\n";
                     break;
                 case OpKind::Store:
-                    os << "STORE [fp-" << (ins.extra->value*4) << "], " << formatOp(*ins.src1) << "\n";
+                    // 【重要修复 3】: 生成汇编时偏移 +1
+                    os << "STORE [fp-" << ((ins.extra->value + 1) * 4) << "], " << formatOp(*ins.src1) << "\n";
                     break;
                 case OpKind::Jump:
                     os << "BR " << ins.extra->label << "\n";
@@ -389,51 +395,26 @@ struct Backend {
     CodeGenConfig cfg;
     CodeGenResult compile(CFG ir) {
         int K = cfg.K;
-
-        // 【修复】引入全局状态计数器
-        int stackSlots = 0;       // 记录已分配的栈槽总数
-        int currentVirt = 1000;   // 记录当前的虚拟寄存器编号，避免冲突
-
+        int stackSlots = 0;
+        int currentVirt = 1000;
         int guard = 20;
 
-        // At most rewrite guard rounds
         while (guard--) {
             auto lv = liveness(ir);
             auto ig = buildInterference(ir, lv);
             auto alloc = allocateRegisters(ig, K);
 
-            // If spilled is empty, we are done
             if (alloc.spilled.empty()) {
-                // Special edge case: K is too small, force spilling even if graph says ok?
-                // Or maybe graph was empty. The original logic for forced spill:
-                if (K <= 2 && !ig.adj.empty()) {
-                    int pick = -1; size_t best = 0;
-                    for (const auto &p : ig.adj) {
-                        size_t deg = p.second.size();
-                        if (deg >= best) { best = deg; pick = p.first; }
-                    }
-                    std::unordered_set<int> forced;
-                    if (pick != -1) forced.insert(pick);
-
-                    // 【修复】调用时传入当前状态
-                    auto rr = rewriteForSpills(ir, forced, currentVirt, stackSlots);
-                    ir = rr.cfg;
-                    stackSlots = rr.nextSlot; // 更新总槽位
-                    currentVirt = rr.nextVirt; // 更新虚拟寄存器ID
-                    continue;
-                }
+                // 【重要修复 4】：移除强制溢出块，直接返回结果
                 return generateAsm(ir, alloc.assign, stackSlots, K);
             }
 
-            // 【修复】正常溢出路径，传入当前状态
-            // 之前的 BUG 是这里默认使用了 startSlot=0，导致多轮溢出时覆盖了之前的槽位
             auto rr = rewriteForSpills(ir, alloc.spilled, currentVirt, stackSlots);
             ir = rr.cfg;
-            stackSlots = rr.nextSlot; // 关键：累加槽位
-            currentVirt = rr.nextVirt; // 关键：更新ID
+            stackSlots = rr.nextSlot;
+            currentVirt = rr.nextVirt;
         }
 
-        // fallback
         auto lv2 = liveness(ir);
         auto ig2 = buildInterference(ir, lv2);
         auto alloc2 = allocateRegisters(ig2, K);
@@ -442,6 +423,7 @@ struct Backend {
 };
 
 } // namespace backend
+
 
 
 int main() {
@@ -564,3 +546,65 @@ int main() {
 
     return 0;
 }
+/*int main() {
+    using namespace backend;
+
+    std::cout << "=== BUG REPRODUCTION: Def-LiveOut Interference Missing ===" << std::endl;
+    std::cout << "Expected Behavior: v1 and v2 must reside in DIFFERENT registers." << std::endl;
+    std::cout << "Failure Mode: v2 overwrites v1 because allocator thinks they don't interfere." << std::endl;
+    std::cout << "--------------------------------------------------------" << std::endl;
+
+    CFG g;
+    BasicBlock b0{0, "ENTRY", {}, {}, {}};
+
+    // 1. 定义 v1 (v1 = 100)
+    // LiveOut: {v1}
+    b0.instrs.push_back(Instr{OpKind::Move, Operand::virt(1), Operand::imm(100), {}, {}});
+
+    // 2. 定义 v2 (v2 = 200)
+    // CRITICAL MOMENT:
+    // - v1 is Live (needed in step 3).
+    // - v2 is Defined here.
+    // - Current logic: Checks LiveIn.
+    //   LiveIn here is {v1}. Since only 1 var is in LiveIn, NO interference edge is added.
+    // - Correct logic: Should connect Def(v2) with LiveOut(v1).
+    b0.instrs.push_back(Instr{OpKind::Move, Operand::virt(2), Operand::imm(200), {}, {}});
+
+    // 3. 使用 v1 和 v2 (v3 = v1 + v2)
+    // Should compute 100 + 200 = 300
+    b0.instrs.push_back(Instr{OpKind::Add, Operand::virt(3), Operand::virt(1), Operand::virt(2), {}});
+
+    // 4. 防止死代码消除，使用一下 v3
+    b0.instrs.push_back(Instr{OpKind::Move, Operand::virt(3), Operand::virt(3), {}, {}});
+
+    g.blocks.push_back(b0);
+
+    // === Compilation ===
+    Backend be;
+    // Set K=2 (R0, R1).
+    // If logic is correct: v1->R0, v2->R1 (or vice versa).
+    // If logic is buggy:   v1->R0, v2->R0 (overwrite!).
+    be.cfg.K = 2;
+
+    std::cout << "Compiling with K=2..." << std::endl;
+    auto out = be.compile(g);
+
+    std::cout << "\nGenerated Assembly:\n-------------------" << std::endl;
+    std::cout << out.asmText << std::endl;
+
+    std::cout << "-------------------" << std::endl;
+    std::cout << "ANALYSIS:" << std::endl;
+    if (out.asmText.find("MOV R0, #100") != std::string::npos &&
+        out.asmText.find("MOV R0, #200") != std::string::npos) {
+        std::cout << "[FAIL] BUG DETECTED!" << std::endl;
+        std::cout << "Both v1 and v2 were assigned to R0." << std::endl;
+        std::cout << "Execution trace:" << std::endl;
+        std::cout << "  R0 = 100" << std::endl;
+        std::cout << "  R0 = 200 (v1 is lost!)" << std::endl;
+        std::cout << "  ADD ..., R0, R0 -> Result is 400 (Should be 300)" << std::endl;
+    } else {
+        std::cout << "[PASS] Logic appears correct (Registers are different)." << std::endl;
+    }
+
+    return 0;
+}*/
