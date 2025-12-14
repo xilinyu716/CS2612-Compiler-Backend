@@ -7,6 +7,7 @@
 #define EXPECT_TRUE(x) do { if(!(x)) { std::cerr << "EXPECT_TRUE failed: " #x " at " << __FILE__ << ":" << __LINE__ << "\n"; return 1; } } while(0)
 #define EXPECT_EQ(a,b) do { if(!((a)==(b))) { std::cerr << "EXPECT_EQ failed: " #a " vs " #b " => " << (a) << " != " << (b) << " at " << __FILE__ << ":" << __LINE__ << "\n"; return 1; } } while(0)
 
+#define UNIT_TEST
 #include "../project1.cpp"
 
 using namespace backend;

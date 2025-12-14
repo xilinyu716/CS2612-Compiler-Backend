@@ -63,7 +63,8 @@ mkdir -p build && cd build
 cmake ..
 cmake --build .
 ./demo
-./run_tests```
+./test_all
+```
 
 
 
