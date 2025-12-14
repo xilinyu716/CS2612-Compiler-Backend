@@ -426,95 +426,195 @@ struct Backend {
 
 
 
-int main() {
+// ==========================================
+// Test Helper Utilities
+// ==========================================
+
+void printHeader(const std::string &title) {
+    std::cout << "\n========================================================" << std::endl;
+    std::cout << "[TEST CASE] " << title << std::endl;
+    std::cout << "========================================================" << std::endl;
+}
+
+void runTest(const std::string &name, backend::CFG &cfg, int K) {
     using namespace backend;
+    printHeader(name);
 
-    std::cout << "Constructing Complex Test Case: High Register Pressure Loop" << std::endl;
-    std::cout << "Scenario: 8 constants live across a loop, with internal branching and accumulation." << std::endl;
+    Backend be;
+    be.cfg.K = K;
 
+    std::cout << ">> Configuration: K=" << K << " physical registers." << std::endl;
+    std::cout << ">> Compiling..." << std::endl;
+
+    auto out = be.compile(cfg);
+
+    std::cout << "\n[Generated Assembly]:\n" << std::endl;
+    std::cout << out.asmText << std::endl;
+    std::cout << "--------------------------------------------------------" << std::endl;
+    std::cout << "[Stats] Stack Slots: " << out.stackSlots
+              << " | Used Regs: " << out.usedRegs << std::endl;
+}
+
+// ==========================================
+// Test Case Constructors
+// ==========================================
+
+// Case 1: Arithmetic chain (Polynomial: y = x^2 + 2x - 5)
+// Tests: MUL, SUB, register reuse in a basic block
+backend::CFG buildArithmeticTest() {
+    using namespace backend;
+    CFG g;
+    BasicBlock b0{0, "ENTRY", {}, {}, {}};
+
+    // v1 = x (input, say 10)
+    b0.instrs.push_back(Instr{OpKind::Move, Operand::virt(1), Operand::imm(10), {}, {}});
+
+    // v2 = x * x
+    b0.instrs.push_back(Instr{OpKind::Mul, Operand::virt(2), Operand::virt(1), Operand::virt(1), {}});
+
+    // v3 = 2
+    b0.instrs.push_back(Instr{OpKind::Move, Operand::virt(3), Operand::imm(2), {}, {}});
+
+    // v4 = 2 * x
+    b0.instrs.push_back(Instr{OpKind::Mul, Operand::virt(4), Operand::virt(3), Operand::virt(1), {}});
+
+    // v5 = x^2 + 2x
+    b0.instrs.push_back(Instr{OpKind::Add, Operand::virt(5), Operand::virt(2), Operand::virt(4), {}});
+
+    // v6 = 5
+    b0.instrs.push_back(Instr{OpKind::Move, Operand::virt(6), Operand::imm(5), {}, {}});
+
+    // v7 = (x^2 + 2x) - 5
+    b0.instrs.push_back(Instr{OpKind::Sub, Operand::virt(7), Operand::virt(5), Operand::virt(6), {}});
+
+    g.blocks.push_back(b0);
+    return g;
+}
+
+// Case 2: Memory Operations & Dead Code
+// Tests: LOAD/STORE in source IR, and variables defined but never used
+backend::CFG buildMemAndDeadTest() {
+    using namespace backend;
+    CFG g;
+    BasicBlock b0{0, "ENTRY", {}, {}, {}};
+
+    // Explicit Load from memory slot 100 into v1
+    b0.instrs.push_back(Instr{OpKind::Load, Operand::virt(1), {}, {}, Operand::mem(100)});
+
+    // Explicit Load from memory slot 101 into v2
+    b0.instrs.push_back(Instr{OpKind::Load, Operand::virt(2), {}, {}, Operand::mem(101)});
+
+    // v3 = v1 + v2
+    b0.instrs.push_back(Instr{OpKind::Add, Operand::virt(3), Operand::virt(1), Operand::virt(2), {}});
+
+    // DEAD CODE: v4 = 999 (Defined but never used)
+    // Allocator should handle this gracefully (assign a reg, even if useless)
+    b0.instrs.push_back(Instr{OpKind::Move, Operand::virt(4), Operand::imm(999), {}, {}});
+
+    // Store result v3 into memory slot 102
+    b0.instrs.push_back(Instr{OpKind::Store, {}, Operand::virt(3), {}, Operand::mem(102)});
+
+    g.blocks.push_back(b0);
+    return g;
+}
+
+// Case 3: Diamond Control Flow (Branch & Merge)
+// Tests: Liveness propagation across splits and joins
+// Structure:
+//      B0
+//     /  \
+//    B1  B2
+//     \  /
+//      B3
+backend::CFG buildDiamondTest() {
+    using namespace backend;
     CFG g;
 
-    // ==========================================
-    // Virtual Register Map:
-    // v1 - v8  : Constants (Loaded once, used inside loop) -> Forces high liveness pressure
-    // v10      : Loop Counter (i)
-    // v11      : Loop Limit (N)
-    // v12      : Accumulator (sum)
-    // v20 - v25: Temporary calculation results
-    // ==========================================
+    // B0: Init v1=10, v2=20. Jump to B1 or B2 based on v1 < v2
+    BasicBlock b0{0, "ENTRY", {}, {1, 2}, {}};
+    b0.instrs.push_back(Instr{OpKind::Move, Operand::virt(1), Operand::imm(10), {}, {}});
+    b0.instrs.push_back(Instr{OpKind::Move, Operand::virt(2), Operand::imm(20), {}, {}});
+    b0.instrs.push_back(Instr{OpKind::CmpLT, Operand::virt(3), Operand::virt(1), Operand::virt(2), {}});
+    b0.instrs.push_back(Instr{OpKind::CJump, {}, Operand::virt(3), {}, Operand::lab("LEFT_BRANCH")});
+    b0.instrs.push_back(Instr{OpKind::Jump, {}, {}, {}, Operand::lab("RIGHT_BRANCH")});
 
-    // --- Block 0: Initialization ---
-    // Init v1..v8, v10=0, v11=10, v12=0
+    // B1: LEFT_BRANCH. v4 = v1 + 5. (Uses v1)
+    BasicBlock b1{1, "LEFT_BRANCH", {}, {3}, {0}};
+    b1.instrs.push_back(Instr{OpKind::Add, Operand::virt(4), Operand::virt(1), Operand::imm(5), {}});
+    b1.instrs.push_back(Instr{OpKind::Jump, {}, {}, {}, Operand::lab("MERGE")});
+
+    // B2: RIGHT_BRANCH. v4 = v2 - 5. (Uses v2)
+    BasicBlock b2{2, "RIGHT_BRANCH", {}, {3}, {0}};
+    b2.instrs.push_back(Instr{OpKind::Sub, Operand::virt(4), Operand::virt(2), Operand::imm(5), {}});
+    b2.instrs.push_back(Instr{OpKind::Jump, {}, {}, {}, Operand::lab("MERGE")});
+
+    // B3: MERGE. v5 = v4 * 2.
+    // Liveness check: v4 is defined in B1 and B2. It must be allocated to the SAME physical location
+    // relative to B3 entry, or moves must be handled (Phi elimination is not implemented here,
+    // so we assume v4 is assigned a unique virtual reg that is live out from both B1/B2).
+    // In SSA form v4 would be different, but here it's the same variable name 'v4'.
+    BasicBlock b3{3, "MERGE", {}, {}, {1, 2}};
+    b3.instrs.push_back(Instr{OpKind::Mul, Operand::virt(5), Operand::virt(4), Operand::imm(2), {}});
+
+    g.blocks.push_back(b0);
+    g.blocks.push_back(b1);
+    g.blocks.push_back(b2);
+    g.blocks.push_back(b3);
+
+    // Setup Preds/Succs manually
+    g.blocks[0].succ = {1, 2};
+    g.blocks[1].succ = {3}; g.blocks[1].pred = {0};
+    g.blocks[2].succ = {3}; g.blocks[2].pred = {0};
+    g.blocks[3].succ = {};  g.blocks[3].pred = {1, 2};
+
+    return g;
+}
+
+// Case 4: Original High Pressure Loop
+backend::CFG buildLoopPressureTest() {
+    using namespace backend;
+    CFG g;
+    // ... (Same construction logic as original main, condensed for brevity) ...
+    // Re-implementing essentially the same logic:
     BasicBlock b0{0, "ENTRY", {}, {1}, {}};
-    for(int i=1; i<=8; ++i) {
-        // v_i = i * 10
-        b0.instrs.push_back(Instr{OpKind::Move, Operand::virt(i), Operand::imm(i * 10), {}, {}});
-    }
-    b0.instrs.push_back(Instr{OpKind::Move, Operand::virt(10), Operand::imm(0), {}, {}});  // i = 0
-    b0.instrs.push_back(Instr{OpKind::Move, Operand::virt(11), Operand::imm(10), {}, {}}); // N = 10
-    b0.instrs.push_back(Instr{OpKind::Move, Operand::virt(12), Operand::imm(0), {}, {}});  // sum = 0
+    for(int i=1; i<=8; ++i) b0.instrs.push_back(Instr{OpKind::Move, Operand::virt(i), Operand::imm(i * 10), {}, {}});
+    b0.instrs.push_back(Instr{OpKind::Move, Operand::virt(10), Operand::imm(0), {}, {}});
+    b0.instrs.push_back(Instr{OpKind::Move, Operand::virt(11), Operand::imm(10), {}, {}});
+    b0.instrs.push_back(Instr{OpKind::Move, Operand::virt(12), Operand::imm(0), {}, {}});
     b0.instrs.push_back(Instr{OpKind::Jump, {}, {}, {}, Operand::lab("LOOP_HEADER")});
 
-    // --- Block 1: Loop Header ---
-    // if i < N goto BODY else goto EXIT
     BasicBlock b1{1, "LOOP_HEADER", {}, {2, 6}, {0, 5}};
-    b1.instrs.push_back(Instr{OpKind::CmpLT, Operand::virt(20), Operand::virt(10), Operand::virt(11), {}}); // t = i < N
+    b1.instrs.push_back(Instr{OpKind::CmpLT, Operand::virt(20), Operand::virt(10), Operand::virt(11), {}});
     b1.instrs.push_back(Instr{OpKind::CJump, {}, Operand::virt(20), {}, Operand::lab("LOOP_BODY")});
     b1.instrs.push_back(Instr{OpKind::Jump, {}, {}, {}, Operand::lab("EXIT")});
 
-    // --- Block 2: Loop Body (Calculations) ---
-    // Force interference: use v1..v8 here.
-    // temp1 = v1 + v2
-    // temp2 = v3 + v4
-    // temp3 = v5 + v6
-    // temp4 = v7 + v8
     BasicBlock b2{2, "LOOP_BODY", {}, {3, 4}, {1}};
     b2.instrs.push_back(Instr{OpKind::Add, Operand::virt(21), Operand::virt(1), Operand::virt(2), {}});
     b2.instrs.push_back(Instr{OpKind::Add, Operand::virt(22), Operand::virt(3), Operand::virt(4), {}});
     b2.instrs.push_back(Instr{OpKind::Add, Operand::virt(23), Operand::virt(5), Operand::virt(6), {}});
     b2.instrs.push_back(Instr{OpKind::Add, Operand::virt(24), Operand::virt(7), Operand::virt(8), {}});
-
-    // Condition: if temp1 < temp2 goto TRUE_BRANCH else goto FALSE_BRANCH
     b2.instrs.push_back(Instr{OpKind::CmpLT, Operand::virt(25), Operand::virt(21), Operand::virt(22), {}});
     b2.instrs.push_back(Instr{OpKind::CJump, {}, Operand::virt(25), {}, Operand::lab("TRUE_BRANCH")});
     b2.instrs.push_back(Instr{OpKind::Jump, {}, {}, {}, Operand::lab("FALSE_BRANCH")});
 
-    // --- Block 3: True Branch ---
-    // sum = sum + temp3
     BasicBlock b3{3, "TRUE_BRANCH", {}, {5}, {2}};
     b3.instrs.push_back(Instr{OpKind::Add, Operand::virt(12), Operand::virt(12), Operand::virt(23), {}});
     b3.instrs.push_back(Instr{OpKind::Jump, {}, {}, {}, Operand::lab("LOOP_LATCH")});
 
-    // --- Block 4: False Branch ---
-    // sum = sum + temp4
     BasicBlock b4{4, "FALSE_BRANCH", {}, {5}, {2}};
     b4.instrs.push_back(Instr{OpKind::Add, Operand::virt(12), Operand::virt(12), Operand::virt(24), {}});
     b4.instrs.push_back(Instr{OpKind::Jump, {}, {}, {}, Operand::lab("LOOP_LATCH")});
 
-    // --- Block 5: Loop Latch (Increment) ---
-    // i = i + 1, goto Header
     BasicBlock b5{5, "LOOP_LATCH", {}, {1}, {3, 4}};
     b5.instrs.push_back(Instr{OpKind::Add, Operand::virt(10), Operand::virt(10), Operand::imm(1), {}});
     b5.instrs.push_back(Instr{OpKind::Jump, {}, {}, {}, Operand::lab("LOOP_HEADER")});
 
-    // --- Block 6: Exit ---
-    // Result is in v12 (sum)
     BasicBlock b6{6, "EXIT", {}, {}, {1}};
-    // Move result to a specific "return" register (e.g. R0) conceptually
-    // Here just a move to itself or a dummy use to ensure v12 is live at end
-    b6.instrs.push_back(Instr{OpKind::Move, Operand::virt(12), Operand::virt(12), {}, {}});
+    b6.instrs.push_back(Instr{OpKind::Move, Operand::virt(12), Operand::virt(12), {}, {}}); // Dummy use
 
-    // Assemble CFG
-    g.blocks.push_back(b0);
-    g.blocks.push_back(b1);
-    g.blocks.push_back(b2);
-    g.blocks.push_back(b3);
-    g.blocks.push_back(b4);
-    g.blocks.push_back(b5);
-    g.blocks.push_back(b6);
+    g.blocks.push_back(b0); g.blocks.push_back(b1); g.blocks.push_back(b2);
+    g.blocks.push_back(b3); g.blocks.push_back(b4); g.blocks.push_back(b5); g.blocks.push_back(b6);
 
-    // Set predecessor/successor relationships manually to match instrs
-    // (Note: The provided implementation uses these vectors for liveness)
     g.blocks[0].succ = {1};
     g.blocks[1].succ = {2, 6}; g.blocks[1].pred = {0, 5};
     g.blocks[2].succ = {3, 4}; g.blocks[2].pred = {1};
@@ -523,26 +623,37 @@ int main() {
     g.blocks[5].succ = {1};    g.blocks[5].pred = {3, 4};
     g.blocks[6].succ = {};     g.blocks[6].pred = {1};
 
-    // ==========================================
-    // Compilation
-    // ==========================================
+    return g;
+}
 
-    Backend be;
-    // CRITICAL: Set K=4.
-    // We have v1..v8 (8 regs) + v10, v11, v12 (3 regs) + temps.
-    // Total live set > 11. K=4 guarantees heavy spilling.
-    be.cfg.K = 4;
 
-    std::cout << "Compiling with K=" << be.cfg.K << " (forcing spills)..." << std::endl;
-    std::cout << "---------------------------------------------" << std::endl;
+// ==========================================
+// Main Driver
+// ==========================================
+int main() {
+    using namespace backend;
 
-    auto out = be.compile(g);
+    // Test 1: Math Chain with ample registers (K=8)
+    // Should verify correct Use/Def logic for MUL/SUB and efficient packing.
+    auto t1 = buildArithmeticTest();
+    runTest("1. Arithmetic Polynomial (y = x^2 + 2x - 5)", t1, 8);
 
-    std::cout << out.asmText << std::endl;
-    std::cout << "---------------------------------------------" << std::endl;
-    std::cout << "Compilation Stats:" << std::endl;
-    std::cout << "Stack Slots Used: " << out.stackSlots << std::endl;
-    std::cout << "Used Registers:   " << out.usedRegs << std::endl;
+    // Test 2: Explicit Memory & Dead Code with K=3
+    // Should verify that LOAD/STORE instructions are preserved and dead code
+    // doesn't crash the allocator.
+    auto t2 = buildMemAndDeadTest();
+    runTest("2. Explicit Memory Access & Dead Code", t2, 3);
+
+    // Test 3: Diamond Control Flow with K=3
+    // Should verify liveness analysis correctness at Merge points.
+    // v4 is defined in branches, used in merge.
+    auto t3 = buildDiamondTest();
+    runTest("3. Diamond Control Flow (Branch & Merge)", t3, 3);
+
+    // Test 4: Heavy Loop Spilling with K=4
+    // The original stress test.
+    auto t4 = buildLoopPressureTest();
+    runTest("4. High Pressure Loop (Forcing Spills)", t4, 4);
 
     return 0;
 }
@@ -608,3 +719,4 @@ int main() {
 
     return 0;
 }*/
+
